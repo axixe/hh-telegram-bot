@@ -41,8 +41,9 @@ from bot.services.account_cache_service import (
     AccountCacheService,
     CachedAccount,
 )
-from bot.services.app_status_service import AppStatusService
+from bot.services.app_status_service import AppStatus, AppStatusService, AutomationStatus
 from bot.services.auth_service import AuthService
+from bot.services.automation_lock_service import AutomationLockService
 from bot.services.automation_stats_service import (
     AutomationStatsService,
     AutomationStatsServiceError,
@@ -207,6 +208,21 @@ def _format_account_panel(account: CachedAccount) -> str:
     return "\n".join(lines)
 
 
+def _format_automation_state(status: AppStatus) -> str:
+    if status.status == AutomationStatus.STARTING:
+        return "🟡 <b>Авто-отклик запускается</b>\n\nПодождите немного."
+    if status.status == AutomationStatus.STOPPING:
+        return "🟡 <b>Авто-отклик останавливается</b>\n\nПодождите немного."
+    if status.status == AutomationStatus.FAILED:
+        return (
+            "⚠️ <b>Последний запуск завершился с ошибкой</b>\n\n"
+            "Можно попробовать запустить сценарий ещё раз."
+        )
+    if status.status == AutomationStatus.STOPPED:
+        return "⚪ <b>Авто-отклик остановлен</b>"
+    return "🟢 <b>Авто-отклик бот запущен</b>\n\nСтатистика пока недоступна."
+
+
 async def _send_account_panel(
     message: Message,
     account_service: AccountService,
@@ -236,7 +252,7 @@ async def _send_account_panel_for_user(
         status = status_service.get_status(telegram_user_id)
         await message.answer(
             _format_account_panel(cached_account),
-            reply_markup=account_keyboard(status.is_running),
+            reply_markup=account_keyboard(status.shows_stop_button),
             parse_mode="HTML",
         )
         return
@@ -262,7 +278,7 @@ async def _send_account_panel_for_user(
         message,
         telegram_user_id,
         _format_account_panel(cached_account),
-        reply_markup=account_keyboard(status.is_running),
+        reply_markup=account_keyboard(status.shows_stop_button),
         parse_mode="HTML",
     )
 
@@ -558,35 +574,40 @@ async def _send_automation_status_panel(
     *,
     edit_existing: bool = False,
 ) -> None:
-    try:
-        stats = await asyncio.to_thread(stats_service.get_stats, telegram_user_id)
-        text = stats_service.format_status(stats)
-    except AutomationStatsServiceError:
-        text = "🟢 <b>Авто-отклик бот запущен</b>\n\nСтатистика пока недоступна."
+    status = status_service.get_status(telegram_user_id)
+    if status.is_running:
+        try:
+            stats = await asyncio.to_thread(stats_service.get_stats, telegram_user_id)
+            text = stats_service.format_status(stats)
+        except AutomationStatsServiceError:
+            text = _format_automation_state(status)
+    else:
+        text = _format_automation_state(status)
 
     if edit_existing:
         await bot.edit_message_text(
             text,
             chat_id=message.chat.id,
             message_id=message.message_id,
-            reply_markup=account_keyboard(is_running=True),
+            reply_markup=account_keyboard(status.shows_stop_button),
             parse_mode="HTML",
         )
         status_message = message
     else:
         status_message = await message.answer(
             text,
-            reply_markup=account_keyboard(is_running=True),
+            reply_markup=account_keyboard(status.shows_stop_button),
             parse_mode="HTML",
         )
-    _start_status_updates(
-        bot=bot,
-        chat_id=status_message.chat.id,
-        message_id=status_message.message_id,
-        telegram_user_id=telegram_user_id,
-        status_service=status_service,
-        stats_service=stats_service,
-    )
+    if status.is_running:
+        _start_status_updates(
+            bot=bot,
+            chat_id=status_message.chat.id,
+            message_id=status_message.message_id,
+            telegram_user_id=telegram_user_id,
+            status_service=status_service,
+            stats_service=stats_service,
+        )
 
 
 async def _start_automation(
@@ -595,11 +616,18 @@ async def _start_automation(
     telegram_user_id: int,
     command_runner: CommandRunner,
     status_service: AppStatusService,
+    lock_service: AutomationLockService,
     cover_letter_service: CoverLetterService,
     stats_service: AutomationStatsService,
     edit_existing: bool = False,
 ) -> None:
-    if status_service.get_status(telegram_user_id).is_running:
+    if not lock_service.acquire_automation_lock(telegram_user_id):
+        await message.answer("Сценарий уже запускается. Подождите немного.")
+        return
+
+    status = status_service.get_status(telegram_user_id)
+    if status.blocks_start:
+        lock_service.release_automation_lock(telegram_user_id)
         await _send_automation_status_panel(
             message,
             bot=bot,
@@ -610,22 +638,44 @@ async def _start_automation(
         )
         return
 
+    status_service.mark_starting(telegram_user_id)
+    start_text = _format_automation_state(status_service.get_status(telegram_user_id))
+    if edit_existing:
+        await bot.edit_message_text(
+            start_text,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            reply_markup=account_keyboard(is_running=True),
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(
+            start_text,
+            reply_markup=account_keyboard(is_running=True),
+            parse_mode="HTML",
+        )
+
     try:
-        command_runner.start_main_automation(
+        await asyncio.to_thread(
+            command_runner.start_main_automation,
             telegram_user_id,
             cover_letter_service.get_letter_path(telegram_user_id),
         )
     except CommandRunnerError:
+        status_service.mark_failed(telegram_user_id)
+        lock_service.release_automation_lock(telegram_user_id)
         await message.answer(
             "⚠️ <b>Не получилось запустить авто-отклик</b>\n\n"
             "Проверьте настройки и hh-applicant-tool.",
             reply_markup=account_keyboard(
-                status_service.get_status(telegram_user_id).is_running
+                status_service.get_status(telegram_user_id).shows_stop_button
             ),
             parse_mode="HTML",
         )
         return
 
+    status_service.clear_transient_status(telegram_user_id)
+    lock_service.release_automation_lock(telegram_user_id)
     await _send_automation_status_panel(
         message,
         bot=bot,
@@ -643,6 +693,7 @@ async def handle_start_button(
     settings: Settings,
     command_runner: CommandRunner,
     status_service: AppStatusService,
+    lock_service: AutomationLockService,
     auth_service: AuthService,
     cover_letter_service: CoverLetterService,
     stats_service: AutomationStatsService,
@@ -660,6 +711,7 @@ async def handle_start_button(
         telegram_user_id=message.from_user.id,
         command_runner=command_runner,
         status_service=status_service,
+        lock_service=lock_service,
         cover_letter_service=cover_letter_service,
         stats_service=stats_service,
     )
@@ -672,6 +724,7 @@ async def handle_start_automation_callback(
     settings: Settings,
     command_runner: CommandRunner,
     status_service: AppStatusService,
+    lock_service: AutomationLockService,
     auth_service: AuthService,
     account_service: AccountService,
     cover_letter_service: CoverLetterService,
@@ -695,6 +748,7 @@ async def handle_start_automation_callback(
         telegram_user_id=user.id,
         command_runner=command_runner,
         status_service=status_service,
+        lock_service=lock_service,
         cover_letter_service=cover_letter_service,
         stats_service=stats_service,
         edit_existing=True,
@@ -912,7 +966,9 @@ async def handle_cover_letter_edit_back(
     await state.clear()
     await message.answer(
         "👤 <b>Вернулся в личный кабинет</b>",
-        reply_markup=account_keyboard(status_service.get_status(message.from_user.id).is_running),
+        reply_markup=account_keyboard(
+            status_service.get_status(message.from_user.id).shows_stop_button
+        ),
         parse_mode="HTML",
     )
 
@@ -959,6 +1015,7 @@ async def handle_stop_button(
     settings: Settings,
     command_runner: CommandRunner,
     status_service: AppStatusService,
+    lock_service: AutomationLockService,
     auth_service: AuthService,
     account_service: AccountService,
     account_cache_service: AccountCacheService,
@@ -970,17 +1027,33 @@ async def handle_stop_button(
     if not await _ensure_authorized(message, auth_service):
         return
 
+    if not lock_service.acquire_automation_lock(message.from_user.id):
+        await message.answer("Сценарий уже меняет состояние. Подождите немного.")
+        return
+
+    status_service.mark_stopping(message.from_user.id)
+    await message.answer(
+        _format_automation_state(status_service.get_status(message.from_user.id)),
+        reply_markup=account_keyboard(is_running=True),
+        parse_mode="HTML",
+    )
     try:
-        command_runner.stop_main_automation(message.from_user.id)
+        await asyncio.to_thread(command_runner.stop_main_automation, message.from_user.id)
     except CommandRunnerError:
+        status_service.mark_failed(message.from_user.id)
+        lock_service.release_automation_lock(message.from_user.id)
         await message.answer(
             "⚠️ <b>Не получилось остановить авто-отклик</b>\n\n"
             "Проверьте hh-applicant-tool.",
-            reply_markup=account_keyboard(status_service.get_status(message.from_user.id).is_running),
+            reply_markup=account_keyboard(
+                status_service.get_status(message.from_user.id).shows_stop_button
+            ),
             parse_mode="HTML",
         )
         return
 
+    status_service.clear_transient_status(message.from_user.id)
+    lock_service.release_automation_lock(message.from_user.id)
     await _send_account_panel(
         message,
         account_service,
@@ -995,6 +1068,7 @@ async def handle_stop_automation_callback(
     settings: Settings,
     command_runner: CommandRunner,
     status_service: AppStatusService,
+    lock_service: AutomationLockService,
     auth_service: AuthService,
     stats_service: AutomationStatsService,
     account_service: AccountService,
@@ -1010,6 +1084,10 @@ async def handle_stop_automation_callback(
         await callback.answer("Сначала пройдите авторизацию.", show_alert=True)
         return
 
+    if not lock_service.acquire_automation_lock(user.id):
+        await callback.answer("Сценарий уже меняет состояние.", show_alert=True)
+        return
+
     try:
         stats = await asyncio.to_thread(stats_service.get_stats, user.id)
     except AutomationStatsServiceError:
@@ -1021,12 +1099,24 @@ async def handle_stop_automation_callback(
         with suppress(asyncio.CancelledError):
             await task
 
+    status_service.mark_stopping(user.id)
+    if isinstance(message, Message):
+        await message.edit_text(
+            _format_automation_state(status_service.get_status(user.id)),
+            reply_markup=account_keyboard(is_running=True),
+            parse_mode="HTML",
+        )
+
     try:
-        command_runner.stop_main_automation(user.id)
+        await asyncio.to_thread(command_runner.stop_main_automation, user.id)
     except CommandRunnerError:
+        status_service.mark_failed(user.id)
+        lock_service.release_automation_lock(user.id)
         await callback.answer("Не получилось остановить сценарий.", show_alert=True)
         return
 
+    status_service.clear_transient_status(user.id)
+    lock_service.release_automation_lock(user.id)
     if isinstance(message, Message):
         if stats:
             with suppress(AutomationStatsServiceError):
@@ -1100,14 +1190,27 @@ async def handle_logout_button(
     if not await _ensure_authorized(message, auth_service):
         return
 
-    if status_service.get_status(message.from_user.id).is_running:
+    status = status_service.get_status(message.from_user.id)
+    if status.status in {AutomationStatus.STARTING, AutomationStatus.STOPPING}:
+        await message.answer(
+            "Подождите, сценарий сейчас меняет состояние. Потом можно выйти из аккаунта.",
+            reply_markup=account_keyboard(status.shows_stop_button),
+        )
+        return
+
+    if status.is_running:
         try:
-            command_runner.stop_main_automation(message.from_user.id)
+            status_service.mark_stopping(message.from_user.id)
+            await asyncio.to_thread(command_runner.stop_main_automation, message.from_user.id)
+            status_service.clear_transient_status(message.from_user.id)
         except CommandRunnerError:
+            status_service.mark_failed(message.from_user.id)
             await message.answer(
                 "⚠️ <b>Не получилось остановить авто-отклик перед выходом</b>\n\n"
                 "Сначала остановите его вручную.",
-                reply_markup=account_keyboard(is_running=True),
+                reply_markup=account_keyboard(
+                    status_service.get_status(message.from_user.id).shows_stop_button
+                ),
                 parse_mode="HTML",
             )
             return
@@ -1119,7 +1222,7 @@ async def handle_logout_button(
             "⚠️ <b>Не получилось выйти из аккаунта HH</b>\n\n"
             "Попробуйте ещё раз чуть позже.",
             reply_markup=account_keyboard(
-                status_service.get_status(message.from_user.id).is_running
+                status_service.get_status(message.from_user.id).shows_stop_button
             ),
             parse_mode="HTML",
         )
@@ -1222,10 +1325,18 @@ async def handle_logout_confirm_callback(
         await callback.answer("Сначала пройдите авторизацию.", show_alert=True)
         return
 
-    if status_service.get_status(user.id).is_running:
+    status = status_service.get_status(user.id)
+    if status.status in {AutomationStatus.STARTING, AutomationStatus.STOPPING}:
+        await callback.answer("Подождите, сценарий сейчас меняет состояние.", show_alert=True)
+        return
+
+    if status.is_running:
         try:
-            command_runner.stop_main_automation(user.id)
+            status_service.mark_stopping(user.id)
+            await asyncio.to_thread(command_runner.stop_main_automation, user.id)
+            status_service.clear_transient_status(user.id)
         except CommandRunnerError:
+            status_service.mark_failed(user.id)
             await callback.answer("Сначала остановите авто-отклик.", show_alert=True)
             return
 
@@ -1285,7 +1396,7 @@ async def handle_unknown(
             await message.answer(
                 _format_account_panel(cached_account),
                 reply_markup=account_keyboard(
-                    status_service.get_status(message.from_user.id).is_running
+                    status_service.get_status(message.from_user.id).shows_stop_button
                 ),
                 parse_mode="HTML",
             )
@@ -1306,6 +1417,7 @@ async def main() -> None:
     settings = load_settings()
     command_runner = CommandRunner(settings.hh_tool_workdir)
     status_service = AppStatusService(command_runner)
+    lock_service = AutomationLockService()
     account_service = AccountService(settings.hh_tool_workdir)
     account_cache_service = AccountCacheService(settings.hh_tool_workdir)
     auth_service = AuthService(account_service, settings.hh_tool_workdir)
@@ -1321,6 +1433,7 @@ async def main() -> None:
         settings=settings,
         command_runner=command_runner,
         status_service=status_service,
+        lock_service=lock_service,
         account_service=account_service,
         account_cache_service=account_cache_service,
         auth_service=auth_service,

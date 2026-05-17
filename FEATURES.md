@@ -98,7 +98,7 @@ last error.
 
 Статус: обязательно.
 
-Sprint 2 — Minimal User Diagnostics
+## Sprint 2 — Minimal User Diagnostics
 
 Цель: дать пользователю понять, что произошло, но не превращать бота в консоль логов.
 
@@ -137,7 +137,7 @@ Authorization headers.
 
 Статус: обязательно, если показываем события/логи.
 
-Sprint 3 — AI v1 через возможности hh-applicant-tool
+## Sprint 3 — AI v1 через возможности hh-applicant-tool
 
 Цель: быстро добавить AI без написания собственного AI-движка.
 
