@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from bot.services.ai_dry_run_service import AiDryRunLaunchOptions
 from bot.services.profile_service import ProfileService
 
 
@@ -36,6 +37,22 @@ class DockerDiagnostics:
         return self.state != DockerContainerState.NOT_FOUND
 
 
+@dataclass(frozen=True)
+class AiDryRunResult:
+    output: str
+    rejected_count: int
+    already_rejected_count: int
+
+
+@dataclass(frozen=True)
+class AutomationLaunchOptions:
+    target_count: int
+    total_pages: int
+    per_page: int
+    ai_filter: str | None = None
+    search_query: str | None = None
+
+
 class CommandRunner:
     AUTOMATION_SCRIPT = textwrap.dedent(
         """
@@ -47,6 +64,11 @@ class CommandRunner:
         excluded_filter = os.environ["HH_EXCLUDED_FILTER"]
         interval_seconds = int(os.getenv("HH_AUTOMATION_INTERVAL_SECONDS", "18000"))
         letter_file = os.getenv("HH_LETTER_FILE")
+        total_pages = os.getenv("HH_AUTOMATION_TOTAL_PAGES")
+        per_page = os.getenv("HH_AUTOMATION_PER_PAGE")
+        ai_filter = os.getenv("HH_AUTOMATION_AI_FILTER")
+        search_query = os.getenv("HH_AUTOMATION_SEARCH")
+        run_once = os.getenv("HH_AUTOMATION_RUN_ONCE") == "1"
 
         while True:
             subprocess.run(base_command + ["refresh-token"], check=False)
@@ -55,9 +77,36 @@ class CommandRunner:
             apply_command = base_command + ["apply-vacancies", "-f"]
             if letter_file:
                 apply_command.extend(["-L", letter_file])
+            if total_pages:
+                apply_command.extend(["--total-pages", total_pages])
+            if per_page:
+                apply_command.extend(["--per-page", per_page])
+            if ai_filter:
+                apply_command.extend(["--ai-filter", ai_filter])
+            if search_query:
+                apply_command.extend(["--search", search_query])
             apply_command.extend(["--excluded-filter", excluded_filter])
             subprocess.run(apply_command, check=False)
 
+            if run_once:
+                break
+
+            time.sleep(interval_seconds)
+        """
+    ).strip()
+
+    RESUME_BUMP_SCRIPT = textwrap.dedent(
+        """
+        import os
+        import subprocess
+        import time
+
+        base_command = ["/usr/local/bin/python", "-m", "hh_applicant_tool"]
+        interval_seconds = int(os.environ["HH_RESUME_BUMP_INTERVAL_SECONDS"])
+
+        while True:
+            subprocess.run(base_command + ["refresh-token"], check=False)
+            subprocess.run(base_command + ["update-resumes"], check=False)
             time.sleep(interval_seconds)
         """
     ).strip()
@@ -75,6 +124,7 @@ class CommandRunner:
         self,
         telegram_user_id: int,
         letter_file: Path | None = None,
+        options: AutomationLaunchOptions | None = None,
     ) -> None:
         diagnostics = self.get_diagnostics(telegram_user_id)
         if diagnostics.state in {
@@ -106,6 +156,14 @@ class CommandRunner:
         container_letter_file = self._get_container_letter_file(letter_file)
         if container_letter_file:
             command.extend(("-e", f"HH_LETTER_FILE={container_letter_file}"))
+        if options:
+            command.extend(("-e", f"HH_AUTOMATION_TOTAL_PAGES={options.total_pages}"))
+            command.extend(("-e", f"HH_AUTOMATION_PER_PAGE={options.per_page}"))
+            command.extend(("-e", "HH_AUTOMATION_RUN_ONCE=1"))
+            if options.ai_filter:
+                command.extend(("-e", f"HH_AUTOMATION_AI_FILTER={options.ai_filter}"))
+            if options.search_query:
+                command.extend(("-e", f"HH_AUTOMATION_SEARCH={options.search_query}"))
         command.extend(
             (
                 "hh_applicant_tool",
@@ -119,9 +177,254 @@ class CommandRunner:
         self._run(("docker", "rm", container_name), check=False, timeout=30)
         self._run(tuple(command))
 
+    def run_ai_dry_run(
+        self,
+        telegram_user_id: int,
+        letter_file: Path | None = None,
+        *,
+        ai_filter: str = "light",
+        total_pages: int = 1,
+        per_page: int = 3,
+    ) -> AiDryRunResult:
+        if ai_filter not in {"light", "heavy"}:
+            raise CommandRunnerError("Unknown AI filter mode")
+
+        diagnostics = self.get_diagnostics(telegram_user_id)
+        if diagnostics.state in {
+            DockerContainerState.CREATED,
+            DockerContainerState.RESTARTING,
+            DockerContainerState.RUNNING,
+        }:
+            raise CommandRunnerError("Application is already running")
+
+        profile_id = ProfileService.get_profile_id(telegram_user_id)
+        container_name = ProfileService.get_container_name(telegram_user_id)
+        command = [
+            "docker",
+            "compose",
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--no-deps",
+            "--user",
+            "docker",
+            "-e",
+            "PYTHONUNBUFFERED=1",
+            "-e",
+            f"HH_PROFILE_ID={profile_id}",
+            "hh_applicant_tool",
+            "python",
+            "-u",
+            "-m",
+            "hh_applicant_tool",
+            "apply-vacancies",
+            "-f",
+            "--dry-run",
+            "--ai-filter",
+            ai_filter,
+            "--ai-rate-limit",
+            "20",
+            "--total-pages",
+            str(total_pages),
+            "--per-page",
+            str(per_page),
+            "--excluded-filter",
+            self.EXCLUDED_FILTER,
+        ]
+        container_letter_file = self._get_container_letter_file(letter_file)
+        if container_letter_file:
+            command.extend(("-L", container_letter_file))
+
+        self._run(("docker", "rm", container_name), check=False, timeout=30)
+        result = self._run(tuple(command), timeout=300)
+        output = (result.stdout + "\n" + result.stderr).strip()
+        return AiDryRunResult(
+            output=output,
+            rejected_count=output.count(f"AI ({ai_filter}) посчитал неподходящей"),
+            already_rejected_count=output.count("Вакансия уже отклонена ранее"),
+        )
+
+    def start_ai_dry_run(
+        self,
+        telegram_user_id: int,
+        options: AiDryRunLaunchOptions,
+        letter_file: Path | None = None,
+        *,
+        ai_filter: str = "light",
+    ) -> None:
+        if ai_filter not in {"light", "heavy"}:
+            raise CommandRunnerError("Unknown AI filter mode")
+
+        diagnostics = self.get_diagnostics(telegram_user_id)
+        if diagnostics.state in {
+            DockerContainerState.CREATED,
+            DockerContainerState.RESTARTING,
+            DockerContainerState.RUNNING,
+        }:
+            raise CommandRunnerError("Application is already running")
+
+        profile_id = ProfileService.get_profile_id(telegram_user_id)
+        container_name = ProfileService.get_container_name(telegram_user_id)
+        command = [
+            "docker",
+            "compose",
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            "--no-deps",
+            "--user",
+            "docker",
+            "-e",
+            "PYTHONUNBUFFERED=1",
+            "-e",
+            f"HH_PROFILE_ID={profile_id}",
+            "hh_applicant_tool",
+            "python",
+            "-u",
+            "-m",
+            "hh_applicant_tool",
+            "-vv",
+            "apply-vacancies",
+            "-f",
+            "--dry-run",
+            "--ai-filter",
+            ai_filter,
+            "--ai-rate-limit",
+            "20",
+            "--total-pages",
+            str(options.total_pages),
+            "--per-page",
+            str(options.per_page),
+            "--excluded-filter",
+            self.EXCLUDED_FILTER,
+        ]
+        if options.search_query:
+            command.extend(("--search", options.search_query))
+        container_letter_file = self._get_container_letter_file(letter_file)
+        if container_letter_file:
+            command.extend(("-L", container_letter_file))
+
+        self._run(("docker", "rm", container_name), check=False, timeout=30)
+        self._run(tuple(command))
+
+    def get_container_logs(
+        self,
+        telegram_user_id: int,
+        *,
+        tail: int | str = 500,
+    ) -> str:
+        container_name = ProfileService.get_container_name(telegram_user_id)
+        result = self._run(
+            (
+                "docker",
+                "logs",
+                "--tail",
+                str(tail),
+                container_name,
+            ),
+            check=False,
+            timeout=20,
+        )
+        return (result.stdout + "\n" + result.stderr).strip()
+
+    def clear_ai_rejected_vacancies(self, telegram_user_id: int) -> str:
+        diagnostics = self.get_diagnostics(telegram_user_id)
+        if diagnostics.state in {
+            DockerContainerState.CREATED,
+            DockerContainerState.RESTARTING,
+            DockerContainerState.RUNNING,
+            DockerContainerState.PAUSED,
+        }:
+            raise CommandRunnerError("Application is already running")
+
+        profile_id = ProfileService.get_profile_id(telegram_user_id)
+        result = self._run(
+            (
+                "docker",
+                "compose",
+                "run",
+                "--rm",
+                "--no-deps",
+                "--user",
+                "docker",
+                "-e",
+                f"HH_PROFILE_ID={profile_id}",
+                "hh_applicant_tool",
+                "python",
+                "-u",
+                "-m",
+                "hh_applicant_tool",
+                "clear-skipped",
+                "--reason",
+                "ai_rejected",
+            ),
+            check=False,
+            timeout=120,
+        )
+        output = (result.stdout + "\n" + result.stderr).strip()
+        if result.returncode != 0:
+            raise CommandRunnerError(output or "hh-applicant-tool command failed")
+        return output
+
     def stop_main_automation(self, telegram_user_id: int) -> None:
         container_name = ProfileService.get_container_name(telegram_user_id)
         diagnostics = self.get_diagnostics(telegram_user_id)
+        if diagnostics.state not in {
+            DockerContainerState.CREATED,
+            DockerContainerState.RESTARTING,
+            DockerContainerState.RUNNING,
+            DockerContainerState.PAUSED,
+        }:
+            return
+
+        self._run(("docker", "stop", container_name), timeout=30)
+        self._run(("docker", "rm", container_name), timeout=30)
+
+    def start_resume_bump(self, telegram_user_id: int, interval_hours: int) -> None:
+        if interval_hours not in {4, 5}:
+            raise CommandRunnerError("Unsupported resume bump interval")
+
+        diagnostics = self.get_resume_bump_diagnostics(telegram_user_id)
+        if diagnostics.state in {
+            DockerContainerState.CREATED,
+            DockerContainerState.RESTARTING,
+            DockerContainerState.RUNNING,
+        }:
+            return
+
+        profile_id = ProfileService.get_profile_id(telegram_user_id)
+        container_name = ProfileService.get_resume_bump_container_name(telegram_user_id)
+        command = [
+            "docker",
+            "compose",
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            "--no-deps",
+            "--user",
+            "docker",
+            "-e",
+            "PYTHONUNBUFFERED=1",
+            "-e",
+            f"HH_PROFILE_ID={profile_id}",
+            "-e",
+            f"HH_RESUME_BUMP_INTERVAL_SECONDS={interval_hours * 60 * 60}",
+            "hh_applicant_tool",
+            "python",
+            "-u",
+            "-c",
+            self.RESUME_BUMP_SCRIPT,
+        ]
+
+        self._run(("docker", "rm", container_name), check=False, timeout=30)
+        self._run(tuple(command))
+
+    def stop_resume_bump(self, telegram_user_id: int) -> None:
+        container_name = ProfileService.get_resume_bump_container_name(telegram_user_id)
+        diagnostics = self.get_resume_bump_diagnostics(telegram_user_id)
         if diagnostics.state not in {
             DockerContainerState.CREATED,
             DockerContainerState.RESTARTING,
@@ -138,6 +441,13 @@ class CommandRunner:
 
     def get_diagnostics(self, telegram_user_id: int) -> DockerDiagnostics:
         container_name = ProfileService.get_container_name(telegram_user_id)
+        return self._get_diagnostics_by_container_name(container_name)
+
+    def get_resume_bump_diagnostics(self, telegram_user_id: int) -> DockerDiagnostics:
+        container_name = ProfileService.get_resume_bump_container_name(telegram_user_id)
+        return self._get_diagnostics_by_container_name(container_name)
+
+    def _get_diagnostics_by_container_name(self, container_name: str) -> DockerDiagnostics:
         result = self._run(
             (
                 "docker",
@@ -196,6 +506,8 @@ class CommandRunner:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 shell=False,
                 timeout=timeout,
             )

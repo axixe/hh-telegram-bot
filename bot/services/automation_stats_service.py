@@ -70,7 +70,12 @@ class AutomationStatsService:
             f"• Приглашений: <b>{stats.invitations_count}</b>"
         )
 
-    def get_period_stats(self, telegram_user_id: int) -> dict[str, PeriodStats]:
+    def get_period_stats(
+        self,
+        telegram_user_id: int,
+        *,
+        include_current_session: bool = False,
+    ) -> dict[str, PeriodStats]:
         now = datetime.now()
         starts = {
             "today": now.replace(hour=0, minute=0, second=0, microsecond=0),
@@ -81,7 +86,11 @@ class AutomationStatsService:
             name: self._get_negotiations_period_stats(telegram_user_id, start)
             for name, start in starts.items()
         }
-        tests_by_period = self._get_tests_by_period(telegram_user_id, starts)
+        current_session_stats = (
+            self._get_current_session_period_stats(telegram_user_id, starts)
+            if include_current_session
+            else {name: PeriodStats() for name in starts}
+        )
         history_stats = {
             name: self._get_history_period_stats(telegram_user_id, start)
             for name, start in starts.items()
@@ -92,10 +101,11 @@ class AutomationStatsService:
                 responses_count=(
                     stats.get("total", 0)
                     + history_stats[name].responses_count
+                    + current_session_stats[name].responses_count
                 ),
                 tests_count=(
-                    tests_by_period.get(name, 0)
-                    + history_stats[name].tests_count
+                    history_stats[name].tests_count
+                    + current_session_stats[name].tests_count
                 ),
                 discards_count=stats.get("discard", 0),
                 invitations_count=stats.get("invitation", 0),
@@ -156,14 +166,18 @@ class AutomationStatsService:
         if not db_path.exists():
             return {}
 
+        connection: sqlite3.Connection | None = None
         try:
-            with sqlite3.connect(db_path) as connection:
-                cursor = connection.execute(
-                    "SELECT state, count(*) FROM negotiations GROUP BY state"
-                )
-                return {str(state): int(count) for state, count in cursor.fetchall()}
+            connection = sqlite3.connect(db_path)
+            cursor = connection.execute(
+                "SELECT state, count(*) FROM negotiations GROUP BY state"
+            )
+            return {str(state): int(count) for state, count in cursor.fetchall()}
         except sqlite3.Error:
             return {}
+        finally:
+            if connection:
+                connection.close()
 
     def _count_responses_from_logs(self, logs: str) -> int:
         sent_lines_count = logs.count(self.SENT_RESPONSE_TEXT)
@@ -185,41 +199,73 @@ class AutomationStatsService:
         if not db_path.exists():
             return {}
 
+        connection: sqlite3.Connection | None = None
         try:
-            with sqlite3.connect(db_path) as connection:
-                cursor = connection.execute(
-                    """
-                    SELECT state, count(*)
-                    FROM negotiations
-                    WHERE created_at >= ?
-                    GROUP BY state
-                    """,
-                    (start.strftime("%Y-%m-%d %H:%M:%S"),),
-                )
-                by_state = {str(state): int(count) for state, count in cursor.fetchall()}
-                by_state["total"] = sum(by_state.values())
-                return by_state
+            connection = sqlite3.connect(db_path)
+            cursor = connection.execute(
+                """
+                SELECT state, count(*)
+                FROM negotiations
+                WHERE created_at >= ?
+                GROUP BY state
+                """,
+                (start.strftime("%Y-%m-%d %H:%M:%S"),),
+            )
+            by_state = {str(state): int(count) for state, count in cursor.fetchall()}
+            by_state["total"] = sum(by_state.values())
+            return by_state
         except sqlite3.Error:
             return {}
+        finally:
+            if connection:
+                connection.close()
 
-    def _get_tests_by_period(
+    def _get_current_session_period_stats(
         self,
         telegram_user_id: int,
         starts: dict[str, datetime],
-    ) -> dict[str, int]:
+    ) -> dict[str, PeriodStats]:
         logs = self._get_container_logs(telegram_user_id, with_timestamps=True)
-        counters = {name: 0 for name in starts}
+        response_line_counters = {name: 0 for name in starts}
+        response_summary_counters = {name: 0 for name in starts}
+        test_counters = {name: 0 for name in starts}
         for line in logs.splitlines():
-            if self.SENT_TEST_RESPONSE_TEXT not in line:
-                continue
             timestamp = self._parse_docker_timestamp(line)
             if not timestamp:
                 continue
+
             local_timestamp = timestamp.astimezone().replace(tzinfo=None)
-            for name, start in starts.items():
-                if local_timestamp >= start:
-                    counters[name] += 1
-        return counters
+            period_names = [
+                name for name, start in starts.items() if local_timestamp >= start
+            ]
+            if not period_names:
+                continue
+
+            if self.SENT_RESPONSE_TEXT in line:
+                for name in period_names:
+                    response_line_counters[name] += 1
+
+            for match in self.SENT_RESPONSES_PATTERN.finditer(line):
+                count = int(match.group(1))
+                for name in period_names:
+                    response_summary_counters[name] += count
+
+            if self.SENT_TEST_RESPONSE_TEXT in line:
+                for name in period_names:
+                    test_counters[name] += 1
+
+        has_response_lines = any(response_line_counters.values())
+        return {
+            name: PeriodStats(
+                responses_count=(
+                    response_line_counters[name]
+                    if has_response_lines
+                    else response_summary_counters[name]
+                ),
+                tests_count=test_counters[name],
+            )
+            for name in starts
+        }
 
     def _parse_docker_timestamp(self, line: str) -> datetime | None:
         raw_timestamp = line.split(" ", 1)[0]
