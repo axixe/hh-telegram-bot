@@ -86,6 +86,7 @@ from bot.services.ai_client import (
 )
 from bot.services.account_cache_service import (
     AccountCacheService,
+    AccountCacheServiceError,
     CachedAccount,
 )
 from bot.services.app_status_service import AppStatus, AppStatusService, AutomationStatus
@@ -1149,6 +1150,7 @@ async def handle_phone(
     state: FSMContext,
     settings: Settings,
     auth_service: AuthService,
+    account_cache_service: AccountCacheService,
 ) -> None:
     if not _is_allowed(message, settings):
         await _deny_access(message)
@@ -1159,6 +1161,8 @@ async def handle_phone(
         return
 
     _track_message(message, message.from_user.id)
+    with suppress(AccountCacheServiceError):
+        account_cache_service.clear(message.from_user.id)
     await _answer_tracked(
         message,
         message.from_user.id,
@@ -1258,6 +1262,8 @@ async def handle_sms_code(
         f"✅ <b>{html.escape(result.user_message)}</b>",
         parse_mode="HTML",
     )
+    with suppress(AccountCacheServiceError):
+        account_cache_service.clear(message.from_user.id)
     with suppress(CommandRunnerError):
         await _ensure_resume_bump_running(
             message.from_user.id,
@@ -2720,6 +2726,7 @@ async def handle_logout_button(
     status_service: AppStatusService,
     auth_service: AuthService,
     account_service: AccountService,
+    account_cache_service: AccountCacheService,
     resume_bump_settings_service: ResumeBumpSettingsService,
 ) -> None:
     if not _is_allowed(message, settings):
@@ -2784,6 +2791,8 @@ async def handle_logout_button(
 
     if message.from_user:
         auth_service.forget_authorized(message.from_user.id)
+        with suppress(AccountCacheServiceError):
+            account_cache_service.clear(message.from_user.id)
     await state.set_state(AuthStates.waiting_for_phone)
     await message.answer(
         "🔴 <b>Вы вышли из аккаунта HH</b>\n\n"
@@ -2866,6 +2875,7 @@ async def handle_logout_confirm_callback(
     status_service: AppStatusService,
     auth_service: AuthService,
     account_service: AccountService,
+    account_cache_service: AccountCacheService,
     resume_bump_settings_service: ResumeBumpSettingsService,
 ) -> None:
     user = callback.from_user
@@ -2911,6 +2921,8 @@ async def handle_logout_confirm_callback(
         return
 
     auth_service.forget_authorized(user.id)
+    with suppress(AccountCacheServiceError):
+        account_cache_service.clear(user.id)
     await state.set_state(AuthStates.waiting_for_phone)
     await _delete_message(message)
     await message.answer(

@@ -73,6 +73,13 @@ class AccountCacheService:
         except OSError as exc:
             raise AccountCacheServiceError("Failed to save account cache") from exc
 
+    def clear(self, telegram_user_id: int) -> None:
+        path = self._get_cache_path(telegram_user_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise AccountCacheServiceError("Failed to clear account cache") from exc
+
     def _get_cache_path(self, telegram_user_id: int) -> Path:
         profile_id = ProfileService.get_profile_id(telegram_user_id)
         return self._workdir / "config" / profile_id / self.CACHE_FILENAME
