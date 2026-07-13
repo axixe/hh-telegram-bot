@@ -9,3 +9,7 @@ class AuthStates(StatesGroup):
 
 class CoverLetterStates(StatesGroup):
     waiting_for_text = State()
+
+
+class AutomationStates(StatesGroup):
+    waiting_for_search_query = State()

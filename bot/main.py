@@ -1,6 +1,7 @@
 import asyncio
 import html
 import logging
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -32,6 +33,9 @@ from bot.keyboards import (
     RESUME_BUMP_OFF_CALLBACK_DATA,
     START_AUTOMATION_AI_CALLBACK_DATA,
     START_AUTOMATION_PLAIN_CALLBACK_DATA,
+    AUTOMATION_CHANGE_QUERY_CALLBACK_DATA,
+    AUTOMATION_CONFIRM_CALLBACK_DATA,
+    AUTOMATION_NEW_QUERY_CALLBACK_DATA,
     BACK_BUTTON_TEXT,
     BACK_TO_ACCOUNT_CALLBACK_DATA,
     COVER_LETTER_CALLBACK_DATA,
@@ -55,7 +59,9 @@ from bot.keyboards import (
     ai_dry_run_result_keyboard,
     automation_ai_mode_keyboard,
     automation_limit_keyboard,
+    automation_preview_keyboard,
     automation_result_keyboard,
+    automation_search_query_keyboard,
     automation_type_keyboard,
     back_keyboard,
     cover_letter_keyboard,
@@ -93,6 +99,7 @@ from bot.services.app_status_service import AppStatus, AppStatusService, Automat
 from bot.services.auth_service import AuthService
 from bot.services.automation_lock_service import AutomationLockService
 from bot.services.automation_stats_service import (
+    AutomationLogSummary,
     AutomationStats,
     AutomationStatsService,
     AutomationStatsServiceError,
@@ -101,6 +108,7 @@ from bot.services.command_runner import (
     AutomationLaunchOptions,
     CommandRunner,
     CommandRunnerError,
+    VacancySearchEstimate,
 )
 from bot.services.cover_letter_service import (
     CoverLetterService,
@@ -115,7 +123,11 @@ from bot.services.resume_bump_settings_service import (
     ResumeBumpSettingsService,
     ResumeBumpSettingsServiceError,
 )
-from bot.states import AuthStates, CoverLetterStates
+from bot.services.search_query_history_service import (
+    SearchQueryHistoryService,
+    SearchQueryHistoryServiceError,
+)
+from bot.states import AuthStates, AutomationStates, CoverLetterStates
 
 
 router = Router()
@@ -142,7 +154,20 @@ class AiAutomationRun:
     ai_filter: str
 
 
+@dataclass(frozen=True)
+class AutomationRunContext:
+    started_at: float
+    target_count: int
+    total_pages: int
+    per_page: int
+    search_query: str
+    estimated_found: int | None = None
+    estimated_available: int | None = None
+    ai_filter: str | None = None
+
+
 _ai_automation_runs_by_user_id: dict[int, AiAutomationRun] = {}
+_automation_runs_by_user_id: dict[int, AutomationRunContext] = {}
 
 
 def _track_message(message: Message | None, telegram_user_id: int | None) -> None:
@@ -473,6 +498,25 @@ def _format_automation_limit_prompt(mode: str, ai_filter: str | None = None) -> 
     )
 
 
+def _format_automation_search_prompt(mode: str, ai_filter: str | None = None) -> str:
+    if mode == "ai":
+        filter_label = "Heavy" if ai_filter == "heavy" else "Light"
+        mode_line = f"Режим: <b>AI / {filter_label}</b>"
+    else:
+        mode_line = "Режим: <b>обычный авто-отклик</b>"
+
+    return (
+        "🔎 <b>Поисковый запрос</b>\n\n"
+        f"{mode_line}\n\n"
+        "Выберите запрос из истории или напишите новый запрос, по которому искать вакансии на HH.\n"
+        "Например: <i>Python backend</i>, <i>Vue frontend</i>, <i>QA automation</i>."
+    )
+
+
+def _normalize_search_query(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
 def _get_automation_launch_options(
     target_count: int,
     ai_filter: str | None = None,
@@ -493,6 +537,7 @@ def _get_automation_launch_options(
             target_count=target_count,
             total_pages=20,
             per_page=100,
+            search_query=search_query,
         )
 
     if target_count not in {10, 30, 50}:
@@ -502,7 +547,159 @@ def _get_automation_launch_options(
         target_count=target_count,
         total_pages=1,
         per_page=target_count,
+        search_query=search_query,
     )
+
+
+def _apply_estimate_to_launch_options(
+    launch_options: AutomationLaunchOptions,
+    estimate: VacancySearchEstimate,
+) -> AutomationLaunchOptions:
+    total_pages = launch_options.total_pages
+    if launch_options.target_count == AI_DRY_RUN_ALL_TARGET and estimate.pages > 0:
+        total_pages = estimate.pages
+
+    return AutomationLaunchOptions(
+        target_count=launch_options.target_count,
+        total_pages=total_pages,
+        per_page=launch_options.per_page,
+        ai_filter=launch_options.ai_filter,
+        search_query=launch_options.search_query,
+        estimated_found=estimate.found,
+        estimated_available=estimate.available_count,
+    )
+
+
+def _format_automation_preview(
+    *,
+    launch_options: AutomationLaunchOptions,
+    estimate: VacancySearchEstimate,
+) -> str:
+    mode_label = (
+        f"AI / {'Heavy' if launch_options.ai_filter == 'heavy' else 'Light'}"
+        if launch_options.ai_filter
+        else "обычный авто-отклик"
+    )
+    target_label = (
+        "все доступные"
+        if launch_options.target_count == AI_DRY_RUN_ALL_TARGET
+        else str(launch_options.target_count)
+    )
+    available_count = estimate.available_count
+    if launch_options.target_count == AI_DRY_RUN_ALL_TARGET:
+        check_label = str(min(available_count, launch_options.total_pages * launch_options.per_page))
+    else:
+        check_label = str(min(available_count, launch_options.target_count))
+
+    lines = [
+        "🔎 <b>Проверка перед запуском</b>",
+        "",
+        f"• запрос: <b>{html.escape(estimate.search_query)}</b>",
+        f"• режим: <b>{mode_label}</b>",
+        f"• цель: <b>{target_label}</b>",
+        "",
+        "📊 <b>Выдача HH</b>",
+        f"• HH нашёл: <b>{estimate.found}</b>",
+        f"• доступно к проходу через API: <b>{available_count}</b>",
+        f"• бот проверит максимум: <b>{check_label}</b>",
+    ]
+
+    if launch_options.target_count == AI_DRY_RUN_ALL_TARGET:
+        lines.append(
+            f"• технический лимит прохода: <b>{launch_options.total_pages} стр. × {launch_options.per_page}</b>"
+        )
+    elif available_count < launch_options.target_count:
+        lines.append("• доступных вакансий меньше выбранного лимита")
+
+    if estimate.found == 0:
+        lines.extend(
+            [
+                "",
+                "По этому запросу HH ничего не нашёл. Лучше изменить запрос перед запуском.",
+            ]
+        )
+    else:
+        lines.extend(["", "Запустить авто-отклик с такими параметрами?"])
+
+    return "\n".join(lines)
+
+
+def _format_duration(seconds: int) -> str:
+    seconds = max(seconds, 0)
+    minutes, rest_seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} ч {minutes} мин"
+    if minutes:
+        return f"{minutes} мин {rest_seconds} сек"
+    return f"{rest_seconds} сек"
+
+
+def _format_automation_final_report(
+    *,
+    summary: AutomationLogSummary,
+    context: AutomationRunContext | None,
+    fallback_stats: AutomationStats | None,
+) -> str:
+    duration_seconds = summary.duration_seconds
+    if duration_seconds <= 0 and context:
+        duration_seconds = round(time.time() - context.started_at)
+
+    search_query = summary.search_query or (context.search_query if context else "")
+    found_count = summary.found_count or (context.estimated_found if context else 0) or 0
+    available_count = (
+        summary.available_count
+        or (context.estimated_available if context else 0)
+        or 0
+    )
+    responses_count = summary.responses_count or (
+        fallback_stats.responses_count if fallback_stats else 0
+    )
+    tests_count = summary.tests_count or (
+        fallback_stats.tests_count if fallback_stats else 0
+    )
+
+    lines = [
+        "⚪ <b>Авто-отклик завершён</b>",
+        "",
+        "⚙️ <b>Запуск</b>",
+    ]
+    if search_query:
+        lines.append(f"• запрос: <b>{html.escape(search_query)}</b>")
+    lines.append(f"• время работы: <b>{_format_duration(duration_seconds)}</b>")
+
+    lines.extend(
+        [
+            "",
+            "📊 <b>Вакансии</b>",
+            f"• HH нашёл: <b>{found_count}</b>",
+            f"• доступно через API: <b>{available_count}</b>",
+            f"• обработано ботом: <b>{summary.processed_count}</b>",
+            "",
+            "📨 <b>Отклики</b>",
+            f"• отправлено: <b>{responses_count}</b>",
+            f"• с тестами: <b>{tests_count}</b>",
+            "",
+            "🧹 <b>Пропуски</b>",
+            f"• уже был отклик/отказ: <b>{summary.relation_skipped_count}</b>",
+            f"• из них отказов: <b>{summary.rejection_relation_count}</b>",
+            f"• уже отклонено AI раньше: <b>{summary.already_ai_rejected_count}</b>",
+            f"• AI отклонил сейчас: <b>{summary.ai_rejected_count}</b>",
+            f"• regex-фильтр: <b>{summary.excluded_filter_count}</b>",
+        ]
+    )
+
+    other_skipped = (
+        summary.archived_count
+        + summary.skipped_tests_count
+        + summary.redirect_count
+    )
+    if other_skipped:
+        lines.append(f"• прочие пропуски: <b>{other_skipped}</b>")
+    if summary.limit_reached:
+        lines.extend(["", "⛔ Остановлено из-за лимита откликов HH."])
+
+    return "\n".join(lines)
 
 
 def _format_ai_dry_run_stats(
@@ -1032,7 +1229,30 @@ async def _update_automation_status_message(
     with suppress(AutomationStatsServiceError):
         final_stats = await asyncio.to_thread(stats_service.get_stats, telegram_user_id)
 
-    if final_stats:
+    final_summary = None
+    with suppress(CommandRunnerError):
+        logs = await asyncio.to_thread(
+            command_runner.get_container_logs,
+            telegram_user_id,
+            tail="all",
+        )
+        final_summary = stats_service.parse_automation_summary(logs)
+
+    context = _automation_runs_by_user_id.pop(telegram_user_id, None)
+    if final_summary:
+        if final_stats:
+            with suppress(AutomationStatsServiceError):
+                await asyncio.to_thread(
+                    stats_service.record_session,
+                    telegram_user_id,
+                    final_stats,
+                )
+        final_text = _format_automation_final_report(
+            summary=final_summary,
+            context=context,
+            fallback_stats=final_stats,
+        )
+    elif final_stats:
         with suppress(AutomationStatsServiceError):
             await asyncio.to_thread(
                 stats_service.record_session,
@@ -1393,6 +1613,17 @@ async def _start_automation(
         return
 
     status_service.mark_starting(telegram_user_id)
+    if launch_options:
+        _automation_runs_by_user_id[telegram_user_id] = AutomationRunContext(
+            started_at=time.time(),
+            target_count=launch_options.target_count,
+            total_pages=launch_options.total_pages,
+            per_page=launch_options.per_page,
+            search_query=launch_options.search_query or "",
+            estimated_found=launch_options.estimated_found,
+            estimated_available=launch_options.estimated_available,
+            ai_filter=launch_options.ai_filter,
+        )
     if launch_options and launch_options.ai_filter:
         _ai_automation_runs_by_user_id[telegram_user_id] = AiAutomationRun(
             target_count=launch_options.target_count,
@@ -1432,6 +1663,7 @@ async def _start_automation(
             launch_options,
         )
     except (CommandRunnerError, HhAiConfigServiceError):
+        _automation_runs_by_user_id.pop(telegram_user_id, None)
         _ai_automation_runs_by_user_id.pop(telegram_user_id, None)
         status_service.mark_failed(telegram_user_id)
         lock_service.release_automation_lock(telegram_user_id)
@@ -1522,10 +1754,12 @@ async def handle_start_automation_callback(
 @router.callback_query(F.data == START_AUTOMATION_PLAIN_CALLBACK_DATA)
 async def handle_start_plain_automation_callback(
     callback: CallbackQuery,
+    state: FSMContext,
     settings: Settings,
     status_service: AppStatusService,
     auth_service: AuthService,
     account_service: AccountService,
+    search_query_history_service: SearchQueryHistoryService,
 ) -> None:
     user = callback.from_user
     message = callback.message
@@ -1542,9 +1776,12 @@ async def handle_start_plain_automation_callback(
         await callback.answer("Авто-отклик уже запущен.", show_alert=True)
         return
 
+    await state.update_data(automation_mode="plain", automation_ai_filter=None)
+    await state.set_state(AutomationStates.waiting_for_search_query)
+    history = search_query_history_service.get_queries(user.id, limit=5)
     await message.edit_text(
-        _format_automation_limit_prompt("plain"),
-        reply_markup=automation_limit_keyboard("plain"),
+        _format_automation_search_prompt("plain"),
+        reply_markup=automation_search_query_keyboard(history),
         parse_mode="HTML",
     )
     await callback.answer()
@@ -1587,10 +1824,12 @@ async def handle_start_ai_automation_callback(
 @router.callback_query(F.data.regexp(r"^automation:start:ai:(light|heavy)$"))
 async def handle_start_ai_automation_mode_callback(
     callback: CallbackQuery,
+    state: FSMContext,
     settings: Settings,
     status_service: AppStatusService,
     auth_service: AuthService,
     account_service: AccountService,
+    search_query_history_service: SearchQueryHistoryService,
 ) -> None:
     user = callback.from_user
     message = callback.message
@@ -1611,12 +1850,120 @@ async def handle_start_ai_automation_mode_callback(
         return
 
     ai_filter = str(callback.data).rsplit(":", 1)[-1]
+    await state.update_data(automation_mode="ai", automation_ai_filter=ai_filter)
+    await state.set_state(AutomationStates.waiting_for_search_query)
+    history = search_query_history_service.get_queries(user.id, limit=5)
     await message.edit_text(
-        _format_automation_limit_prompt("ai", ai_filter),
-        reply_markup=automation_limit_keyboard("ai", ai_filter),
+        _format_automation_search_prompt("ai", ai_filter),
+        reply_markup=automation_search_query_keyboard(history),
         parse_mode="HTML",
     )
     await callback.answer()
+
+
+@router.message(AutomationStates.waiting_for_search_query)
+async def handle_automation_search_query(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    status_service: AppStatusService,
+    auth_service: AuthService,
+    account_service: AccountService,
+) -> None:
+    if not _is_allowed(message, settings):
+        await _deny_access(message)
+        return
+    if not message.from_user:
+        return
+    if not await _is_authorized_user(message.from_user.id, auth_service, account_service):
+        await message.answer("Сначала пройдите авторизацию.")
+        return
+    if status_service.get_status(message.from_user.id).blocks_start:
+        await state.clear()
+        await message.answer("Авто-отклик уже запущен. Сначала остановите текущий сценарий.")
+        return
+
+    search_query = _normalize_search_query(message.text)
+    if len(search_query) < 2:
+        await message.answer(
+            "Запрос слишком короткий. Напишите, какую работу искать, например: <i>Python backend</i>.",
+            parse_mode="HTML",
+        )
+        return
+    if len(search_query) > 120:
+        await message.answer("Запрос слишком длинный. Сократите его до 120 символов.")
+        return
+
+    data = await state.get_data()
+    mode = str(data.get("automation_mode") or "plain")
+    ai_filter = data.get("automation_ai_filter")
+    await state.update_data(automation_search_query=search_query)
+    await message.answer(
+        _format_automation_limit_prompt(mode, str(ai_filter) if ai_filter else None),
+        reply_markup=automation_limit_keyboard(mode, str(ai_filter) if ai_filter else None),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^automation:query:(new|\d+)$"))
+async def handle_automation_history_query_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    status_service: AppStatusService,
+    auth_service: AuthService,
+    account_service: AccountService,
+    search_query_history_service: SearchQueryHistoryService,
+) -> None:
+    user = callback.from_user
+    message = callback.message
+    if user.id not in settings.telegram_allowed_user_ids:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if not isinstance(message, Message):
+        await callback.answer("Сообщение недоступно.", show_alert=True)
+        return
+    if not await _is_authorized_user(user.id, auth_service, account_service):
+        await callback.answer("Сначала пройдите авторизацию.", show_alert=True)
+        return
+    if status_service.get_status(user.id).blocks_start:
+        await callback.answer("Авто-отклик уже запущен.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    mode = str(data.get("automation_mode") or "plain")
+    ai_filter = data.get("automation_ai_filter")
+    selected = str(callback.data).rsplit(":", 1)[-1]
+    if selected == "new":
+        await state.set_state(AutomationStates.waiting_for_search_query)
+        history = search_query_history_service.get_queries(user.id, limit=5)
+        await message.edit_text(
+            _format_automation_search_prompt(mode, str(ai_filter) if ai_filter else None),
+            reply_markup=automation_search_query_keyboard(history),
+            parse_mode="HTML",
+        )
+        await callback.answer("Напишите новый запрос сообщением.")
+        return
+
+    try:
+        index = int(selected)
+    except ValueError:
+        await callback.answer("Неизвестный запрос.", show_alert=True)
+        return
+
+    history = search_query_history_service.get_queries(user.id, limit=5)
+    if index < 0 or index >= len(history):
+        await callback.answer("Запрос уже недоступен.", show_alert=True)
+        return
+
+    search_query = history[index]
+    await state.update_data(automation_search_query=search_query)
+    await message.edit_text(
+        _format_automation_limit_prompt(mode, str(ai_filter) if ai_filter else None),
+        reply_markup=automation_limit_keyboard(mode, str(ai_filter) if ai_filter else None),
+        parse_mode="HTML",
+    )
+    await callback.answer("Запрос выбран.")
 
 
 @router.callback_query(
@@ -1624,17 +1971,13 @@ async def handle_start_ai_automation_mode_callback(
 )
 async def handle_start_automation_limit_callback(
     callback: CallbackQuery,
-    bot: Bot,
+    state: FSMContext,
     settings: Settings,
     command_runner: CommandRunner,
     status_service: AppStatusService,
-    lock_service: AutomationLockService,
     auth_service: AuthService,
     account_service: AccountService,
-    account_cache_service: AccountCacheService,
-    cover_letter_service: CoverLetterService,
-    stats_service: AutomationStatsService,
-    hh_ai_config_service: HhAiConfigService,
+    search_query_history_service: SearchQueryHistoryService,
 ) -> None:
     user = callback.from_user
     message = callback.message
@@ -1666,15 +2009,19 @@ async def handle_start_automation_limit_callback(
         await callback.answer("AI выключен в настройках.", show_alert=True)
         return
 
-    search_query = None
-    if ai_filter:
-        search_query = _get_ai_dry_run_search_query(user.id, account_cache_service)
-        if not search_query:
-            with suppress(AccountServiceError):
-                summary = await asyncio.to_thread(account_service.get_summary, user.id)
-                account_cache_service.save_summary(user.id, summary)
-                if summary.resumes:
-                    search_query = summary.resumes[0].title.strip() or None
+    data = await state.get_data()
+    search_query = _normalize_search_query(str(data.get("automation_search_query") or ""))
+    if not search_query:
+        await state.update_data(automation_mode=mode, automation_ai_filter=ai_filter)
+        await state.set_state(AutomationStates.waiting_for_search_query)
+        history = search_query_history_service.get_queries(user.id, limit=5)
+        await message.edit_text(
+            _format_automation_search_prompt(mode, ai_filter),
+            reply_markup=automation_search_query_keyboard(history),
+            parse_mode="HTML",
+        )
+        await callback.answer("Сначала задайте поисковый запрос.", show_alert=True)
+        return
 
     try:
         launch_options = _get_automation_launch_options(
@@ -1686,6 +2033,146 @@ async def handle_start_automation_limit_callback(
         await callback.answer("Неизвестный режим запуска.", show_alert=True)
         return
 
+    await callback.answer("Проверяю выдачу HH...")
+    try:
+        estimate = await asyncio.to_thread(
+            command_runner.estimate_vacancy_search,
+            user.id,
+            search_query=search_query,
+            total_pages=launch_options.total_pages,
+            per_page=launch_options.per_page,
+        )
+    except CommandRunnerError:
+        await message.edit_text(
+            "⚠️ <b>Не получилось проверить выдачу HH</b>\n\n"
+            "Проверьте авторизацию HH и попробуйте ещё раз.",
+            reply_markup=automation_limit_keyboard(mode, ai_filter),
+            parse_mode="HTML",
+        )
+        return
+
+    launch_options = _apply_estimate_to_launch_options(launch_options, estimate)
+    with suppress(SearchQueryHistoryServiceError):
+        search_query_history_service.add_query(user.id, search_query)
+
+    await state.update_data(
+        automation_mode=mode,
+        automation_ai_filter=ai_filter,
+        automation_target_count=target_count,
+        automation_search_query=search_query,
+        automation_total_pages=launch_options.total_pages,
+        automation_per_page=launch_options.per_page,
+        automation_estimated_found=estimate.found,
+        automation_estimated_available=estimate.available_count,
+    )
+    await message.edit_text(
+        _format_automation_preview(
+            launch_options=launch_options,
+            estimate=estimate,
+        ),
+        reply_markup=automation_preview_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == AUTOMATION_CHANGE_QUERY_CALLBACK_DATA)
+async def handle_automation_change_query_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    status_service: AppStatusService,
+    auth_service: AuthService,
+    account_service: AccountService,
+    search_query_history_service: SearchQueryHistoryService,
+) -> None:
+    user = callback.from_user
+    message = callback.message
+    if user.id not in settings.telegram_allowed_user_ids:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if not isinstance(message, Message):
+        await callback.answer("Сообщение недоступно.", show_alert=True)
+        return
+    if not await _is_authorized_user(user.id, auth_service, account_service):
+        await callback.answer("Сначала пройдите авторизацию.", show_alert=True)
+        return
+    if status_service.get_status(user.id).blocks_start:
+        await callback.answer("Авто-отклик уже запущен.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    mode = str(data.get("automation_mode") or "plain")
+    ai_filter = data.get("automation_ai_filter")
+    await state.set_state(AutomationStates.waiting_for_search_query)
+    history = search_query_history_service.get_queries(user.id, limit=5)
+    await message.edit_text(
+        _format_automation_search_prompt(mode, str(ai_filter) if ai_filter else None),
+        reply_markup=automation_search_query_keyboard(history),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == AUTOMATION_CONFIRM_CALLBACK_DATA)
+async def handle_automation_confirm_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    settings: Settings,
+    command_runner: CommandRunner,
+    status_service: AppStatusService,
+    lock_service: AutomationLockService,
+    auth_service: AuthService,
+    account_service: AccountService,
+    cover_letter_service: CoverLetterService,
+    stats_service: AutomationStatsService,
+    hh_ai_config_service: HhAiConfigService,
+) -> None:
+    user = callback.from_user
+    message = callback.message
+    if user.id not in settings.telegram_allowed_user_ids:
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    if not isinstance(message, Message):
+        await callback.answer("Сообщение недоступно.", show_alert=True)
+        return
+    if not await _is_authorized_user(user.id, auth_service, account_service):
+        await callback.answer("Сначала пройдите авторизацию.", show_alert=True)
+        return
+    if status_service.get_status(user.id).blocks_start:
+        await callback.answer("Авто-отклик уже запущен.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    mode = str(data.get("automation_mode") or "plain")
+    ai_filter = data.get("automation_ai_filter")
+    search_query = _normalize_search_query(str(data.get("automation_search_query") or ""))
+    raw_target_count = data.get("automation_target_count")
+    try:
+        target_count = int(raw_target_count)
+        launch_options = AutomationLaunchOptions(
+            target_count=target_count,
+            total_pages=int(data.get("automation_total_pages") or 0),
+            per_page=int(data.get("automation_per_page") or 0),
+            ai_filter=str(ai_filter) if ai_filter else None,
+            search_query=search_query,
+            estimated_found=int(data.get("automation_estimated_found") or 0),
+            estimated_available=int(data.get("automation_estimated_available") or 0),
+        )
+        if launch_options.total_pages <= 0 or launch_options.per_page <= 0:
+            raise ValueError("Invalid automation limits")
+    except (TypeError, ValueError):
+        await callback.answer("Параметры запуска устарели. Начните запуск заново.", show_alert=True)
+        return
+
+    if mode == "ai" and not settings.ai.enabled:
+        await callback.answer("AI выключен в настройках.", show_alert=True)
+        return
+    if not search_query:
+        await callback.answer("Сначала задайте поисковый запрос.", show_alert=True)
+        return
+
+    await state.clear()
     await _start_automation(
         message,
         bot=bot,
@@ -3002,6 +3489,7 @@ async def main() -> None:
     ai_client = AiClient(settings.ai)
     hh_ai_config_service = HhAiConfigService(settings.hh_tool_workdir, settings.ai)
     resume_bump_settings_service = ResumeBumpSettingsService(settings.hh_tool_workdir)
+    search_query_history_service = SearchQueryHistoryService(settings.hh_tool_workdir)
 
     for telegram_user_id in settings.telegram_allowed_user_ids:
         try:
@@ -3035,6 +3523,7 @@ async def main() -> None:
         ai_client=ai_client,
         hh_ai_config_service=hh_ai_config_service,
         resume_bump_settings_service=resume_bump_settings_service,
+        search_query_history_service=search_query_history_service,
     )
 
 

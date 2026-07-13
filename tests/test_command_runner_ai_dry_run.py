@@ -9,6 +9,7 @@ from bot.services.command_runner import (
     CommandRunner,
     DockerContainerState,
     DockerDiagnostics,
+    VacancySearchEstimate,
 )
 from bot.services.ai_dry_run_service import get_ai_dry_run_launch_options
 
@@ -42,11 +43,17 @@ class FakeCommandRunner(CommandRunner):
         return subprocess.CompletedProcess(
             args=list(command),
             returncode=0,
-            stdout=(
-                "🧠 AI (light) посчитал неподходящей https://example.test\n"
-                "⏩ Вакансия уже отклонена ранее https://example.test/old\n"
-            ),
+            stdout=self._get_stdout(command),
             stderr="",
+        )
+
+    def _get_stdout(self, command: tuple[str, ...]) -> str:
+        if "call-api" in command:
+            return '{"found": 234, "pages": 3, "items": []}'
+
+        return (
+            "🧠 AI (light) посчитал неподходящей https://example.test\n"
+            "⏩ Вакансия уже отклонена ранее https://example.test/old\n"
         )
 
 
@@ -123,6 +130,32 @@ class CommandRunnerAiDryRunTest(unittest.TestCase):
         self.assertIn("100", command)
         self.assertIn("--search", command)
         self.assertIn("Frontend-разработчик", command)
+
+    def test_estimate_vacancy_search_uses_whitelisted_vacancies_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = FakeCommandRunner(Path(tmp))
+
+            estimate = runner.estimate_vacancy_search(
+                123,
+                search_query="  Frontend  Vue  ",
+                total_pages=20,
+                per_page=100,
+            )
+
+        command = runner.commands[-1]
+        self.assertIsInstance(estimate, VacancySearchEstimate)
+        self.assertEqual(estimate.search_query, "Frontend  Vue")
+        self.assertEqual(estimate.found, 234)
+        self.assertEqual(estimate.pages, 3)
+        self.assertEqual(estimate.available_count, 234)
+        self.assertEqual(estimate.max_checked_count, 234)
+        self.assertIn("call-api", command)
+        self.assertIn("/vacancies", command)
+        self.assertIn("text=Frontend  Vue", command)
+        self.assertIn("page=0", command)
+        self.assertIn("per_page=100", command)
+        self.assertIn("HH_PROFILE_ID=tg_123", command)
+        self.assertNotIn("shell=True", command)
 
     def test_launch_options_map_targets_to_candidate_buffer(self) -> None:
         self.assertEqual(get_ai_dry_run_launch_options(10).total_pages, 2)

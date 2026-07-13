@@ -15,6 +15,9 @@ from bot.keyboards import (
     AI_DRY_RUN_BACK_BUTTON_TEXT,
     AI_DRY_RUN_REJECTED_BUTTON_TEXT,
     AI_TEST_BUTTON_TEXT,
+    AUTOMATION_CHANGE_QUERY_BUTTON_TEXT,
+    AUTOMATION_CONFIRM_BUTTON_TEXT,
+    AUTOMATION_NEW_QUERY_BUTTON_TEXT,
     AUTOMATION_AI_BUTTON_TEXT,
     AUTOMATION_PLAIN_BUTTON_TEXT,
     COVER_LETTER_BUTTON_TEXT,
@@ -30,7 +33,9 @@ from bot.keyboards import (
     account_keyboard,
     automation_ai_mode_keyboard,
     automation_limit_keyboard,
+    automation_preview_keyboard,
     automation_result_keyboard,
+    automation_search_query_keyboard,
     automation_type_keyboard,
     resume_bump_settings_keyboard,
     settings_keyboard,
@@ -148,6 +153,47 @@ class KeyboardTest(unittest.TestCase):
                 AI_DRY_RUN_BACK_BUTTON_TEXT,
             ],
         )
+
+    def test_automation_preview_keyboard_has_confirm_change_and_back(self) -> None:
+        texts = [
+            button.text
+            for row in automation_preview_keyboard().inline_keyboard
+            for button in row
+        ]
+
+        self.assertEqual(
+            texts,
+            [
+                AUTOMATION_CONFIRM_BUTTON_TEXT,
+                AUTOMATION_CHANGE_QUERY_BUTTON_TEXT,
+                "↩️ Назад",
+            ],
+        )
+
+    def test_automation_search_query_keyboard_has_history_new_and_back(self) -> None:
+        keyboard = automation_search_query_keyboard(["Frontend", "Python backend"])
+        texts = [
+            button.text
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+
+        self.assertEqual(
+            texts,
+            [
+                "Frontend",
+                "Python backend",
+                AUTOMATION_NEW_QUERY_BUTTON_TEXT,
+                "↩️ Назад",
+            ],
+        )
+        self.assertIn("automation:query:0", callbacks)
+        self.assertIn("automation:query:1", callbacks)
 
     def test_settings_keyboard_has_cover_letter_and_ai_clear(self) -> None:
         texts = [

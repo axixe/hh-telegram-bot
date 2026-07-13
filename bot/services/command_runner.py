@@ -1,3 +1,4 @@
+import json
 import subprocess
 import textwrap
 from dataclasses import dataclass
@@ -51,6 +52,25 @@ class AutomationLaunchOptions:
     per_page: int
     ai_filter: str | None = None
     search_query: str | None = None
+    estimated_found: int | None = None
+    estimated_available: int | None = None
+
+
+@dataclass(frozen=True)
+class VacancySearchEstimate:
+    search_query: str
+    found: int
+    pages: int
+    per_page: int
+    requested_pages: int
+
+    @property
+    def max_checked_count(self) -> int:
+        return min(self.available_count, self.requested_pages * self.per_page)
+
+    @property
+    def available_count(self) -> int:
+        return min(self.found, self.pages * self.per_page)
 
 
 class CommandRunner:
@@ -308,6 +328,66 @@ class CommandRunner:
 
         self._run(("docker", "rm", container_name), check=False, timeout=30)
         self._run(tuple(command))
+
+    def estimate_vacancy_search(
+        self,
+        telegram_user_id: int,
+        *,
+        search_query: str,
+        total_pages: int,
+        per_page: int,
+    ) -> VacancySearchEstimate:
+        normalized_query = search_query.strip()
+        if not normalized_query:
+            raise CommandRunnerError("Search query is empty")
+        if total_pages <= 0 or per_page <= 0:
+            raise CommandRunnerError("Invalid search limits")
+
+        profile_id = ProfileService.get_profile_id(telegram_user_id)
+        result = self._run(
+            (
+                "docker",
+                "compose",
+                "run",
+                "--rm",
+                "--no-deps",
+                "--user",
+                "docker",
+                "-e",
+                f"HH_PROFILE_ID={profile_id}",
+                "hh_applicant_tool",
+                "python",
+                "-u",
+                "-m",
+                "hh_applicant_tool",
+                "call-api",
+                "/vacancies",
+                f"text={normalized_query}",
+                "page=0",
+                f"per_page={per_page}",
+            ),
+            timeout=120,
+        )
+        output = (result.stdout or "").strip()
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise CommandRunnerError("Failed to parse vacancy search estimate") from exc
+
+        try:
+            found = int(payload.get("found", 0))
+            pages = int(payload.get("pages", 0))
+        except (TypeError, ValueError) as exc:
+            raise CommandRunnerError("Invalid vacancy search estimate") from exc
+
+        requested_pages = min(total_pages, pages) if pages > 0 else 0
+        return VacancySearchEstimate(
+            search_query=normalized_query,
+            found=max(found, 0),
+            pages=max(pages, 0),
+            per_page=per_page,
+            requested_pages=max(requested_pages, 0),
+        )
 
     def get_container_logs(
         self,

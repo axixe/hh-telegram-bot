@@ -29,11 +29,32 @@ class PeriodStats:
     invitations_count: int = 0
 
 
+@dataclass(frozen=True)
+class AutomationLogSummary:
+    duration_seconds: int = 0
+    search_query: str = ""
+    found_count: int = 0
+    available_count: int = 0
+    processed_count: int = 0
+    responses_count: int = 0
+    tests_count: int = 0
+    relation_skipped_count: int = 0
+    rejection_relation_count: int = 0
+    archived_count: int = 0
+    skipped_tests_count: int = 0
+    redirect_count: int = 0
+    excluded_filter_count: int = 0
+    already_ai_rejected_count: int = 0
+    ai_rejected_count: int = 0
+    limit_reached: bool = False
+
+
 class AutomationStatsService:
     SENT_RESPONSES_PATTERN = re.compile(r"Отправлено:\s*(\d+)")
     SENT_RESPONSE_TEXT = "Отправили отклик на вакансию"
     SENT_TEST_RESPONSE_TEXT = "Отправили отклик на вакансию с тестом"
     HISTORY_FILENAME = "telegram_automation_stats.json"
+    SUMMARY_PREFIX = "TELEGRAM_AUTOMATION_SUMMARY "
 
     def __init__(self, workdir: Path) -> None:
         self._workdir = workdir
@@ -142,6 +163,41 @@ class AutomationStatsService:
             f"{self._format_period('7 дней', stats['week'])}\n\n"
             f"{self._format_period('30 дней', stats['month'])}"
         )
+
+    def parse_automation_summary(self, logs: str) -> AutomationLogSummary | None:
+        for raw_line in reversed(logs.splitlines()):
+            line = raw_line.strip()
+            if self.SUMMARY_PREFIX not in line:
+                continue
+
+            payload_text = line.split(self.SUMMARY_PREFIX, 1)[-1].strip()
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(payload, dict):
+                return None
+
+            return AutomationLogSummary(
+                duration_seconds=_to_int(payload.get("duration_seconds")),
+                search_query=str(payload.get("search") or ""),
+                found_count=_to_int(payload.get("found_count")),
+                available_count=_to_int(payload.get("available_count")),
+                processed_count=_to_int(payload.get("processed_count")),
+                responses_count=_to_int(payload.get("responses_count")),
+                tests_count=_to_int(payload.get("tests_count")),
+                relation_skipped_count=_to_int(payload.get("relation_skipped_count")),
+                rejection_relation_count=_to_int(payload.get("rejection_relation_count")),
+                archived_count=_to_int(payload.get("archived_count")),
+                skipped_tests_count=_to_int(payload.get("skipped_tests_count")),
+                redirect_count=_to_int(payload.get("redirect_count")),
+                excluded_filter_count=_to_int(payload.get("excluded_filter_count")),
+                already_ai_rejected_count=_to_int(payload.get("already_ai_rejected_count")),
+                ai_rejected_count=_to_int(payload.get("ai_rejected_count")),
+                limit_reached=bool(payload.get("limit_reached")),
+            )
+
+        return None
 
     def _get_container_logs(
         self,
@@ -356,3 +412,10 @@ class AutomationStatsService:
             raise AutomationStatsServiceError("Failed to read automation stats")
 
         return result
+
+
+def _to_int(value: object) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0

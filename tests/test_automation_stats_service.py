@@ -106,6 +106,32 @@ class AutomationStatsServiceTest(unittest.TestCase):
             self.assertEqual(stats["today"].invitations_count, 0)
             self.assertEqual(stats["month"].responses_count, 2)
 
+    def test_parse_automation_summary_reads_last_machine_line(self) -> None:
+        service = FakeAutomationStatsService(Path("."))
+
+        summary = service.parse_automation_summary(
+            "\n".join(
+                [
+                    "ordinary log",
+                    'TELEGRAM_AUTOMATION_SUMMARY {"duration_seconds": 12, "search": "Frontend", "found_count": 1600, "available_count": 1000, "processed_count": 42, "responses_count": 5, "tests_count": 1, "already_ai_rejected_count": 7, "ai_rejected_count": 9, "excluded_filter_count": 3, "limit_reached": true}',
+                ]
+            )
+        )
+
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary.duration_seconds, 12)
+        self.assertEqual(summary.search_query, "Frontend")
+        self.assertEqual(summary.found_count, 1600)
+        self.assertEqual(summary.available_count, 1000)
+        self.assertEqual(summary.processed_count, 42)
+        self.assertEqual(summary.responses_count, 5)
+        self.assertEqual(summary.tests_count, 1)
+        self.assertEqual(summary.already_ai_rejected_count, 7)
+        self.assertEqual(summary.ai_rejected_count, 9)
+        self.assertEqual(summary.excluded_filter_count, 3)
+        self.assertTrue(summary.limit_reached)
+
 
 if __name__ == "__main__":
     unittest.main()
