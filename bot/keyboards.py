@@ -34,7 +34,7 @@ AUTOMATION_PLAIN_BUTTON_TEXT = "🚀 Обычный авто-отклик"
 AUTOMATION_AI_BUTTON_TEXT = "🧠 Авто-отклик с AI"
 AUTOMATION_CONFIRM_BUTTON_TEXT = "✅ Запустить"
 AUTOMATION_CHANGE_QUERY_BUTTON_TEXT = "✏️ Изменить запрос"
-AUTOMATION_NEW_QUERY_BUTTON_TEXT = "➕ Новый запрос"
+AUTOMATION_RESUME_TITLE_QUERY_BUTTON_TEXT = "📄 По названию резюме"
 RESUME_BUMP_BUTTON_PREFIX = "🔁 Поднятие резюме:"
 RESUME_BUMP_OFF_BUTTON_TEXT = "Выключить"
 RESUME_BUMP_4H_BUTTON_TEXT = "Каждые 4 часа"
@@ -67,7 +67,7 @@ LOGOUT_CONFIRM_YES_CALLBACK_DATA = "account:logout:yes"
 LOGOUT_CONFIRM_NO_CALLBACK_DATA = "account:logout:no"
 AUTOMATION_CONFIRM_CALLBACK_DATA = "automation:confirm"
 AUTOMATION_CHANGE_QUERY_CALLBACK_DATA = "automation:change_query"
-AUTOMATION_NEW_QUERY_CALLBACK_DATA = "automation:query:new"
+AUTOMATION_RESUME_TITLE_QUERY_CALLBACK_DATA = "automation:query:resume_title"
 AUTOMATION_QUERY_CALLBACK_PREFIX = "automation:query"
 
 
@@ -304,23 +304,20 @@ def automation_limit_keyboard(mode: str, ai_filter: str | None = None) -> Inline
 
 
 def automation_search_query_keyboard(history: list[str]) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=AUTOMATION_RESUME_TITLE_QUERY_BUTTON_TEXT,
+                callback_data=AUTOMATION_RESUME_TITLE_QUERY_CALLBACK_DATA,
+            )
+        ]
+    ]
     for index, query in enumerate(history[:5]):
         rows.append(
             [
                 InlineKeyboardButton(
                     text=query[:60],
                     callback_data=f"{AUTOMATION_QUERY_CALLBACK_PREFIX}:{index}",
-                )
-            ]
-        )
-
-    if rows:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=AUTOMATION_NEW_QUERY_BUTTON_TEXT,
-                    callback_data=AUTOMATION_NEW_QUERY_CALLBACK_DATA,
                 )
             ]
         )

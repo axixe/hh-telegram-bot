@@ -17,7 +17,7 @@ from bot.keyboards import (
     AI_TEST_BUTTON_TEXT,
     AUTOMATION_CHANGE_QUERY_BUTTON_TEXT,
     AUTOMATION_CONFIRM_BUTTON_TEXT,
-    AUTOMATION_NEW_QUERY_BUTTON_TEXT,
+    AUTOMATION_RESUME_TITLE_QUERY_BUTTON_TEXT,
     AUTOMATION_AI_BUTTON_TEXT,
     AUTOMATION_PLAIN_BUTTON_TEXT,
     COVER_LETTER_BUTTON_TEXT,
@@ -170,7 +170,7 @@ class KeyboardTest(unittest.TestCase):
             ],
         )
 
-    def test_automation_search_query_keyboard_has_history_new_and_back(self) -> None:
+    def test_automation_search_query_keyboard_has_resume_title_history_and_back(self) -> None:
         keyboard = automation_search_query_keyboard(["Frontend", "Python backend"])
         texts = [
             button.text
@@ -186,12 +186,13 @@ class KeyboardTest(unittest.TestCase):
         self.assertEqual(
             texts,
             [
+                AUTOMATION_RESUME_TITLE_QUERY_BUTTON_TEXT,
                 "Frontend",
                 "Python backend",
-                AUTOMATION_NEW_QUERY_BUTTON_TEXT,
                 "↩️ Назад",
             ],
         )
+        self.assertIn("automation:query:resume_title", callbacks)
         self.assertIn("automation:query:0", callbacks)
         self.assertIn("automation:query:1", callbacks)
 

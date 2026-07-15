@@ -35,7 +35,7 @@ from bot.keyboards import (
     START_AUTOMATION_PLAIN_CALLBACK_DATA,
     AUTOMATION_CHANGE_QUERY_CALLBACK_DATA,
     AUTOMATION_CONFIRM_CALLBACK_DATA,
-    AUTOMATION_NEW_QUERY_CALLBACK_DATA,
+    AUTOMATION_RESUME_TITLE_QUERY_CALLBACK_DATA,
     BACK_BUTTON_TEXT,
     BACK_TO_ACCOUNT_CALLBACK_DATA,
     COVER_LETTER_CALLBACK_DATA,
@@ -858,6 +858,31 @@ def _get_ai_dry_run_search_query(
     return title or None
 
 
+async def _get_resume_title_search_query(
+    telegram_user_id: int,
+    account_service: AccountService,
+    account_cache_service: AccountCacheService,
+) -> str | None:
+    account = account_cache_service.get(telegram_user_id)
+    if account and account.resumes:
+        title = account.resumes[0].title.strip()
+        if title:
+            return title
+
+    try:
+        summary = await asyncio.to_thread(account_service.get_summary, telegram_user_id)
+    except AccountServiceError:
+        return None
+
+    with suppress(AccountCacheServiceError):
+        account_cache_service.save_summary(telegram_user_id, summary)
+    if not summary.resumes:
+        return None
+
+    title = summary.resumes[0].title.strip()
+    return title or None
+
+
 def _get_ai_dry_run_log_tail(target_count: int) -> int | str:
     return "all" if target_count == AI_DRY_RUN_ALL_TARGET else 1200
 
@@ -1121,6 +1146,33 @@ async def _delete_message(message: Message | None) -> None:
         return
     with suppress(TelegramBadRequest):
         await message.delete()
+
+
+async def _remember_automation_query_prompt(
+    state: FSMContext,
+    message: Message,
+) -> None:
+    await state.update_data(
+        automation_query_prompt_chat_id=message.chat.id,
+        automation_query_prompt_message_id=message.message_id,
+    )
+
+
+async def _delete_automation_query_prompt(
+    bot: Bot,
+    state: FSMContext,
+) -> None:
+    data = await state.get_data()
+    chat_id = data.get("automation_query_prompt_chat_id")
+    message_id = data.get("automation_query_prompt_message_id")
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        return
+    with suppress(TelegramBadRequest):
+        await bot.delete_message(chat_id, message_id)
+    await state.update_data(
+        automation_query_prompt_chat_id=None,
+        automation_query_prompt_message_id=None,
+    )
 
 
 async def _delete_callback_message(callback: CallbackQuery) -> Message | None:
@@ -1784,6 +1836,7 @@ async def handle_start_plain_automation_callback(
         reply_markup=automation_search_query_keyboard(history),
         parse_mode="HTML",
     )
+    await _remember_automation_query_prompt(state, message)
     await callback.answer()
 
 
@@ -1858,6 +1911,7 @@ async def handle_start_ai_automation_mode_callback(
         reply_markup=automation_search_query_keyboard(history),
         parse_mode="HTML",
     )
+    await _remember_automation_query_prompt(state, message)
     await callback.answer()
 
 
@@ -1898,6 +1952,8 @@ async def handle_automation_search_query(
     mode = str(data.get("automation_mode") or "plain")
     ai_filter = data.get("automation_ai_filter")
     await state.update_data(automation_search_query=search_query)
+    await _delete_automation_query_prompt(message.bot, state)
+    await _delete_message(message)
     await message.answer(
         _format_automation_limit_prompt(mode, str(ai_filter) if ai_filter else None),
         reply_markup=automation_limit_keyboard(mode, str(ai_filter) if ai_filter else None),
@@ -1905,7 +1961,7 @@ async def handle_automation_search_query(
     )
 
 
-@router.callback_query(F.data.regexp(r"^automation:query:(new|\d+)$"))
+@router.callback_query(F.data.regexp(r"^automation:query:(resume_title|\d+)$"))
 async def handle_automation_history_query_callback(
     callback: CallbackQuery,
     state: FSMContext,
@@ -1913,6 +1969,7 @@ async def handle_automation_history_query_callback(
     status_service: AppStatusService,
     auth_service: AuthService,
     account_service: AccountService,
+    account_cache_service: AccountCacheService,
     search_query_history_service: SearchQueryHistoryService,
 ) -> None:
     user = callback.from_user
@@ -1934,31 +1991,35 @@ async def handle_automation_history_query_callback(
     mode = str(data.get("automation_mode") or "plain")
     ai_filter = data.get("automation_ai_filter")
     selected = str(callback.data).rsplit(":", 1)[-1]
-    if selected == "new":
-        await state.set_state(AutomationStates.waiting_for_search_query)
-        history = search_query_history_service.get_queries(user.id, limit=5)
-        await message.edit_text(
-            _format_automation_search_prompt(mode, str(ai_filter) if ai_filter else None),
-            reply_markup=automation_search_query_keyboard(history),
-            parse_mode="HTML",
+    if selected == "resume_title":
+        search_query = await _get_resume_title_search_query(
+            user.id,
+            account_service,
+            account_cache_service,
         )
-        await callback.answer("Напишите новый запрос сообщением.")
-        return
+        if not search_query:
+            await callback.answer("Не получилось получить название резюме.", show_alert=True)
+            return
+    else:
+        try:
+            index = int(selected)
+        except ValueError:
+            await callback.answer("Неизвестный запрос.", show_alert=True)
+            return
 
-    try:
-        index = int(selected)
-    except ValueError:
-        await callback.answer("Неизвестный запрос.", show_alert=True)
-        return
+        history = search_query_history_service.get_queries(user.id, limit=5)
+        if index < 0 or index >= len(history):
+            await callback.answer("Запрос уже недоступен.", show_alert=True)
+            return
+        search_query = history[index]
 
-    history = search_query_history_service.get_queries(user.id, limit=5)
-    if index < 0 or index >= len(history):
-        await callback.answer("Запрос уже недоступен.", show_alert=True)
-        return
-
-    search_query = history[index]
     await state.update_data(automation_search_query=search_query)
-    await message.edit_text(
+    await _delete_message(message)
+    await state.update_data(
+        automation_query_prompt_chat_id=None,
+        automation_query_prompt_message_id=None,
+    )
+    await message.answer(
         _format_automation_limit_prompt(mode, str(ai_filter) if ai_filter else None),
         reply_markup=automation_limit_keyboard(mode, str(ai_filter) if ai_filter else None),
         parse_mode="HTML",
@@ -2020,6 +2081,7 @@ async def handle_start_automation_limit_callback(
             reply_markup=automation_search_query_keyboard(history),
             parse_mode="HTML",
         )
+        await _remember_automation_query_prompt(state, message)
         await callback.answer("Сначала задайте поисковый запрос.", show_alert=True)
         return
 
@@ -2034,6 +2096,11 @@ async def handle_start_automation_limit_callback(
         return
 
     await callback.answer("Проверяю выдачу HH...")
+    await _delete_message(message)
+    loader_message = await message.answer(
+        "🔎 Ищу вакансии на HH и собираю данные по выдаче. Подождите немного.",
+        parse_mode="HTML",
+    )
     try:
         estimate = await asyncio.to_thread(
             command_runner.estimate_vacancy_search,
@@ -2043,7 +2110,7 @@ async def handle_start_automation_limit_callback(
             per_page=launch_options.per_page,
         )
     except CommandRunnerError:
-        await message.edit_text(
+        await loader_message.edit_text(
             "⚠️ <b>Не получилось проверить выдачу HH</b>\n\n"
             "Проверьте авторизацию HH и попробуйте ещё раз.",
             reply_markup=automation_limit_keyboard(mode, ai_filter),
@@ -2065,7 +2132,8 @@ async def handle_start_automation_limit_callback(
         automation_estimated_found=estimate.found,
         automation_estimated_available=estimate.available_count,
     )
-    await message.edit_text(
+    await _delete_message(loader_message)
+    await message.answer(
         _format_automation_preview(
             launch_options=launch_options,
             estimate=estimate,
@@ -2110,6 +2178,7 @@ async def handle_automation_change_query_callback(
         reply_markup=automation_search_query_keyboard(history),
         parse_mode="HTML",
     )
+    await _remember_automation_query_prompt(state, message)
     await callback.answer()
 
 
